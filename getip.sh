@@ -1,444 +1,471 @@
 #!/bin/bash
-# getip.sh — 全平台多网卡 IP 自动配置脚本
-# 支持: Ubuntu 16+, Debian 9+, CentOS/RHEL 7/8/9, Fedora, Rocky, AlmaLinux, openSUSE 等
-# 策略: 检测发行版 → 选择网络栈 → DHCP 激活 → 抓取 IP/GW → 写入持久配置
+# 多发行版多网卡 DHCP + 策略路由配置脚本
+# 支持: Ubuntu 16.04+, Debian, CentOS 6/7/8, RHEL, Fedora
 
-set -euo pipefail
-
-# ──────────────────────────────────────────────
-# 0. 权限检查
-# ──────────────────────────────────────────────
+# ============================================================
+# 基础检查
+# ============================================================
 if [ "$EUID" -ne 0 ]; then
-    echo "[ERROR] 请使用 root 或 sudo 运行此脚本" >&2
+    echo "请使用 sudo 或 root 运行此脚本"
     exit 1
 fi
 
-# ──────────────────────────────────────────────
-# 1. 检测发行版 + 网络管理器
-# ──────────────────────────────────────────────
-detect_distro() {
+# ============================================================
+# 颜色输出
+# ============================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# ============================================================
+# 检测发行版信息
+# ============================================================
+detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        DISTRO_ID="${ID,,}"          # 转小写: ubuntu / debian / centos / fedora ...
-        DISTRO_VER="${VERSION_ID:-0}"
-        DISTRO_LIKE="${ID_LIKE:-}"
+        OS=$ID
+        OS_VERSION_ID=$VERSION_ID
+        OS_VERSION_MAJOR=$(echo $VERSION_ID | cut -d. -f1)
+        OS_VERSION_MINOR=$(echo $VERSION_ID | cut -d. -f2)
+        OS_LIKE=$ID_LIKE
     elif [ -f /etc/redhat-release ]; then
-        DISTRO_ID="rhel"
-        DISTRO_VER=$(grep -oP '\d+' /etc/redhat-release | head -1)
-        DISTRO_LIKE="rhel"
+        OS="centos"
+        OS_VERSION_ID=$(grep -oE '[0-9]+\.[0-9]+' /etc/redhat-release | head -1)
+        OS_VERSION_MAJOR=$(echo $OS_VERSION_ID | cut -d. -f1)
+    elif [ -f /etc/debian_version ]; then
+        OS="debian"
+        OS_VERSION_ID=$(cat /etc/debian_version)
+        OS_VERSION_MAJOR=$(echo $OS_VERSION_ID | cut -d. -f1)
     else
-        DISTRO_ID="unknown"
-        DISTRO_VER="0"
-        DISTRO_LIKE=""
+        error "无法识别的操作系统"
     fi
+    info "操作系统: $OS $OS_VERSION_ID"
 }
 
-# 判断主网络栈类型
-detect_network_stack() {
-    # netplan: Ubuntu 17.10+ 默认；也可能出现在其他发行版
+# ============================================================
+# 检测网络管理方式 + 细化版本语法差异
+# ============================================================
+detect_network_manager() {
+    # Ubuntu 17.10+ (netplan)
     if command -v netplan &>/dev/null && [ -d /etc/netplan ]; then
-        NETWORK_STACK="netplan"
-        return
-    fi
-    # NetworkManager: RHEL/CentOS/Fedora/Rocky/Alma 及部分桌面系统
-    if command -v nmcli &>/dev/null && systemctl is-active NetworkManager &>/dev/null 2>&1; then
-        NETWORK_STACK="networkmanager"
-        return
-    fi
-    # systemd-networkd: 部分最小化 Debian/Ubuntu 或容器环境
-    if systemctl is-active systemd-networkd &>/dev/null 2>&1; then
-        NETWORK_STACK="systemd-networkd"
-        return
-    fi
-    # ifupdown: Debian 传统方式
-    if command -v ifup &>/dev/null && [ -f /etc/network/interfaces ]; then
-        NETWORK_STACK="ifupdown"
-        return
-    fi
-    # 兜底: 仅用 ip 命令操作，不写持久化配置
-    NETWORK_STACK="iproute2-only"
-}
+        NET_MANAGER="netplan"
 
-# ──────────────────────────────────────────────
-# 2. 获取所有物理网卡（排除 lo、虚拟、docker 等）
-# ──────────────────────────────────────────────
-get_physical_ifaces() {
-    local ifaces=()
-    for dev in /sys/class/net/*; do
-        local ifname
-        ifname=$(basename "$dev")
-        [ "$ifname" = "lo" ] && continue
-        # 排除虚拟设备: docker、virbr、veth、tun、tap、bond、bridge 等
-        [[ "$ifname" =~ ^(docker|virbr|veth|tun|tap|bond|br-|dummy|ovs-) ]] && continue
-        # 判断是否为物理网卡（有实体 driver 链接）
-        if [ -e "$dev/device" ] || [ -L "$dev/device" ]; then
-            ifaces+=("$ifname")
-        fi
-    done
-    # 按自然顺序排序
-    printf '%s\n' "${ifaces[@]}" | sort -V
-}
+        # 检测 netplan 版本
+        NETPLAN_VER=$(netplan version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
+        NETPLAN_MAJOR=$(echo $NETPLAN_VER | cut -d. -f1)
+        NETPLAN_MINOR=$(echo $NETPLAN_VER | cut -d. -f2)
+        info "Netplan 版本: $NETPLAN_VER"
 
-# ──────────────────────────────────────────────
-# 3. DHCP 激活（跨平台通用）
-# ──────────────────────────────────────────────
-activate_dhcp_all() {
-    local ifaces=("$@")
-    echo "[INFO] 激活 ${#ifaces[@]} 块网卡的 DHCP..."
-    for IF in "${ifaces[@]}"; do
-        ip link set "$IF" up 2>/dev/null || true
-        if command -v dhclient &>/dev/null; then
-            dhclient -r "$IF" &>/dev/null || true
-            dhclient "$IF" &>/dev/null &
-        elif command -v dhcpcd &>/dev/null; then
-            dhcpcd -n "$IF" &>/dev/null &
+        # to: default 语法在 0.104+ 才支持，否则用 0.0.0.0/0
+        if [ "${NETPLAN_MAJOR:-0}" -gt 0 ] || [ "${NETPLAN_MINOR:-0}" -ge 104 ]; then
+            NETPLAN_ROUTE_TO="default"
         else
-            # 最后兜底: udhcpc (busybox 环境)
-            udhcpc -i "$IF" -n -q &>/dev/null &
+            NETPLAN_ROUTE_TO="0.0.0.0/0"
+        fi
+
+        # routing-policy priority 字段在 0.99+ 才支持
+        if [ "${NETPLAN_MINOR:-0}" -ge 99 ] || [ "${NETPLAN_MAJOR:-0}" -gt 0 ]; then
+            NETPLAN_SUPPORT_PRIORITY=true
+        else
+            NETPLAN_SUPPORT_PRIORITY=false
+        fi
+
+        # use-routes: false 在 0.100+ 支持
+        if [ "${NETPLAN_MINOR:-0}" -ge 100 ] || [ "${NETPLAN_MAJOR:-0}" -gt 0 ]; then
+            NETPLAN_SUPPORT_USE_ROUTES=true
+        else
+            NETPLAN_SUPPORT_USE_ROUTES=false
+        fi
+
+        info "路由语法: to=$NETPLAN_ROUTE_TO | priority支持=$NETPLAN_SUPPORT_PRIORITY | use-routes支持=$NETPLAN_SUPPORT_USE_ROUTES"
+
+    # CentOS/RHEL/Fedora with NetworkManager
+    elif command -v nmcli &>/dev/null && systemctl is-active NetworkManager &>/dev/null 2>&1; then
+        NET_MANAGER="nmcli"
+
+        # 检测 nmcli 版本，routing-rules 在 1.18+ 支持
+        NMCLI_VER=$(nmcli --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+        NMCLI_MAJOR=$(echo $NMCLI_VER | cut -d. -f1)
+        NMCLI_MINOR=$(echo $NMCLI_VER | cut -d. -f2)
+        info "NetworkManager 版本: $NMCLI_VER"
+
+        if [ "$NMCLI_MAJOR" -gt 1 ] || { [ "$NMCLI_MAJOR" -eq 1 ] && [ "$NMCLI_MINOR" -ge 18 ]; }; then
+            NMCLI_SUPPORT_ROUTING_RULES=true
+        else
+            NMCLI_SUPPORT_ROUTING_RULES=false
+        fi
+        info "nmcli routing-rules支持: $NMCLI_SUPPORT_ROUTING_RULES"
+
+    # CentOS 6 / 旧版 RHEL（无 NetworkManager 或未启动）
+    elif [ -d /etc/sysconfig/network-scripts ]; then
+        NET_MANAGER="network-scripts"
+        info "使用传统 network-scripts 管理"
+
+    # Ubuntu 16.04- / Debian
+    elif [ -f /etc/network/interfaces ]; then
+        NET_MANAGER="ifupdown"
+
+        # ifupdown 版本检测
+        IFUPDOWN_VER=$(dpkg -l ifupdown 2>/dev/null | grep '^ii' | awk '{print $3}' | cut -d. -f1)
+        info "ifupdown 版本: $IFUPDOWN_VER"
+
+    else
+        error "无法识别网络管理方式"
+    fi
+
+    info "网络管理方式: $NET_MANAGER"
+}
+
+# ============================================================
+# 获取物理网卡（排除 lo 和虚拟网卡）
+# ============================================================
+get_interfaces() {
+    IFACES=""
+    for IF in $(ls /sys/class/net | grep -v lo | sort -V); do
+        # 排除虚拟接口：docker、virbr、veth、tun、tap、bond等
+        if echo "$IF" | grep -qE '^(docker|virbr|veth|tun|tap|bond|dummy|br-)'; then
+            warn "跳过虚拟网卡: $IF"
+            continue
+        fi
+        # 检查是否有物理地址
+        if [ -f /sys/class/net/$IF/address ]; then
+            IFACES="$IFACES $IF"
         fi
     done
-    echo "[INFO] 等待 DHCP 协商完成（最长 60 秒）..."
-    # 等待所有后台 DHCP 进程完成
-    wait 2>/dev/null || true
-    # 动态等待：轮询直到所有网卡都有 IP，或超时
-    local deadline=$((SECONDS + 60))
-    while [ $SECONDS -lt $deadline ]; do
-        local pending=0
-        for IF in "${ifaces[@]}"; do
-            ip -4 addr show "$IF" 2>/dev/null | grep -q "inet " || pending=$((pending + 1))
-        done
-        [ "$pending" -eq 0 ] && break
-        echo "[INFO] 还有 $pending 块网卡未获取到 IP，继续等待..."
-        sleep 3
-    done
+    IFACES=$(echo $IFACES | xargs)  # 去除首尾空格
+    info "物理网卡列表: $IFACES"
 }
 
-# ──────────────────────────────────────────────
-# 4. 抓取每块网卡的 IP + 网关（纯 iproute2，全平台通用）
-# ──────────────────────────────────────────────
-get_ip_gw() {
-    local IF="$1"
-    IP=$(ip -4 addr show "$IF" 2>/dev/null \
-         | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1 || true)
-    GW=$(ip route show dev "$IF" 2>/dev/null \
-         | awk '/^default/{print $3; exit}' || true)
-    PREFIX=$(ip -4 addr show "$IF" 2>/dev/null \
-             | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | grep -oP '\d+$' | head -n1 || true)
-    PREFIX="${PREFIX:-24}"
+# ============================================================
+# 写入 iproute2 路由表（通用）
+# ============================================================
+add_rt_table() {
+    local T_ID=$1
+    local IF=$2
+    if ! grep -q "^$T_ID " /etc/iproute2/rt_tables; then
+        echo "$T_ID rt_$IF" >> /etc/iproute2/rt_tables
+        info "添加路由表: $T_ID rt_$IF"
+    fi
 }
 
-# ──────────────────────────────────────────────
-# 5. 写入配置 — netplan
-# ──────────────────────────────────────────────
-write_netplan() {
-    local ifaces=("$@")
-    local CONF_FILE="/etc/netplan/50-cloud-init.yaml"
-    local T_ID=100
-    local METRIC=100
+# ============================================================
+# 方案一：Netplan（Ubuntu 17.10+）
+# ============================================================
+configure_netplan() {
+    # 找到实际使用的 netplan 配置文件
+    CONF_FILE=$(ls /etc/netplan/*.yaml 2>/dev/null | head -1)
+    [ -z "$CONF_FILE" ] && CONF_FILE="/etc/netplan/50-cloud-init.yaml"
+    cp "$CONF_FILE" "${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    info "配置文件: $CONF_FILE"
 
-    echo "[INFO] 使用 netplan 写入配置: $CONF_FILE"
-    cat > "$CONF_FILE" << 'YAML_HEAD'
+    info "--- [Netplan] 步骤 1: 生成临时 DHCP 配置 ---"
+    cat <<EOF > $CONF_FILE
 network:
   version: 2
   ethernets:
-YAML_HEAD
+EOF
+    for IF in $IFACES; do
+        MAC=$(cat /sys/class/net/$IF/address)
+        cat <<EOF >> $CONF_FILE
+    $IF:
+      match:
+        macaddress: "$MAC"
+      set-name: "$IF"
+      dhcp4: true
+      mtu: 1500
+EOF
+    done
+    netplan apply
+    info "等待 8 秒完成 DHCP 协商..."
+    sleep 8
 
-    for IF in "${ifaces[@]}"; do
-        local MAC IP GW PREFIX
-        MAC=$(cat "/sys/class/net/$IF/address" 2>/dev/null || echo "")
-        get_ip_gw "$IF"
+    info "--- [Netplan] 步骤 2: 生成最终策略路由配置 ---"
+    cat <<EOF > $CONF_FILE
+network:
+  version: 2
+  ethernets:
+EOF
+    T_ID=100
+    METRIC=100
+    for IF in $IFACES; do
+        MAC=$(cat /sys/class/net/$IF/address)
+        IP=$(ip -4 addr show $IF | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        GW=$(ip route show dev $IF | grep default | awk '{print $3}' | head -n 1)
 
         if [ -z "$IP" ] || [ -z "$GW" ]; then
-            echo "[WARN] $IF 未获取到 IP/GW，写入基础 DHCP 配置"
-            cat >> "$CONF_FILE" << YAML
+            warn "$IF 未获取到 IP/GW，写入基础 DHCP 配置"
+            cat <<EOF >> $CONF_FILE
     $IF:
       match:
         macaddress: "$MAC"
       set-name: "$IF"
       dhcp4: true
-      dhcp6: false
       mtu: 1500
       dhcp4-overrides:
         route-metric: $METRIC
-YAML
+EOF
         else
-            echo "[INFO] $IF  IP=$IP/$PREFIX  GW=$GW  table=$T_ID  metric=$METRIC"
-            cat >> "$CONF_FILE" << YAML
+            info "写入 $IF: IP=$IP GW=$GW Table=$T_ID Metric=$METRIC"
+
+            # 根据版本决定是否写 use-routes
+            DHCP_OVERRIDES="      dhcp4-overrides:
+        route-metric: $METRIC"
+            if [ "$NETPLAN_SUPPORT_USE_ROUTES" = true ]; then
+                DHCP_OVERRIDES="$DHCP_OVERRIDES
+        use-routes: false"
+            fi
+
+            # 根据版本决定是否写 priority
+            ROUTING_POLICY="      routing-policy:
+        - from: $IP
+          table: $T_ID"
+            if [ "$NETPLAN_SUPPORT_PRIORITY" = true ]; then
+                ROUTING_POLICY="$ROUTING_POLICY
+          priority: $METRIC"
+            fi
+
+            cat <<EOF >> $CONF_FILE
     $IF:
       match:
         macaddress: "$MAC"
       set-name: "$IF"
       dhcp4: true
-      dhcp6: false
       mtu: 1500
-      dhcp4-overrides:
-        route-metric: $METRIC
-      routing-policy:
-        - from: $IP
-          table: $T_ID
+$DHCP_OVERRIDES
+$ROUTING_POLICY
       routes:
-        - to: default
+        - to: $NETPLAN_ROUTE_TO
           via: $GW
           table: $T_ID
-YAML
+          metric: $METRIC
+EOF
         fi
         T_ID=$((T_ID + 2))
         METRIC=$((METRIC + 100))
     done
 
-    netplan apply
-    echo "[OK] netplan 配置已应用"
+    info "--- [Netplan] 步骤 3: 应用最终配置 ---"
+    netplan apply && info "配置成功！" || error "netplan apply 失败，请检查 $CONF_FILE"
 }
 
-# ──────────────────────────────────────────────
-# 6. 写入配置 — NetworkManager (nmcli)
-# ──────────────────────────────────────────────
-write_networkmanager() {
-    local ifaces=("$@")
-    local METRIC=100
-
-    echo "[INFO] 使用 NetworkManager (nmcli) 写入配置"
-    for IF in "${ifaces[@]}"; do
-        local IP GW PREFIX
-        get_ip_gw "$IF"
-        local CON_NAME="con-${IF}"
-
-        # 删除旧连接（如有）
+# ============================================================
+# 方案二：nmcli（CentOS 7/8, RHEL, Fedora）
+# ============================================================
+configure_nmcli() {
+    info "--- [nmcli] 步骤 1: 为每个网卡创建 DHCP 连接 ---"
+    for IF in $IFACES; do
+        CON_NAME="con-$IF"
         nmcli con delete "$CON_NAME" &>/dev/null || true
+        nmcli con add type ethernet \
+            con-name "$CON_NAME" \
+            ifname "$IF" \
+            ipv4.method auto \
+            connection.autoconnect yes
+        nmcli con up "$CON_NAME"
+    done
+
+    info "等待 8 秒完成 DHCP 协商..."
+    sleep 8
+
+    info "--- [nmcli] 步骤 2: 配置策略路由 ---"
+    T_ID=100
+    METRIC=100
+    for IF in $IFACES; do
+        CON_NAME="con-$IF"
+        IP=$(ip -4 addr show $IF | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        GW=$(ip route show dev $IF | grep default | awk '{print $3}' | head -n 1)
 
         if [ -z "$IP" ] || [ -z "$GW" ]; then
-            echo "[WARN] $IF 未获取到 IP/GW，创建 DHCP 连接"
-            nmcli con add \
-                type ethernet \
-                ifname "$IF" \
-                con-name "$CON_NAME" \
-                ipv4.method auto \
-                ipv4.route-metric "$METRIC" \
-                connection.autoconnect yes
+            warn "$IF 未获取到 IP/GW，跳过策略路由"
         else
-            echo "[INFO] $IF  IP=$IP/$PREFIX  GW=$GW  metric=$METRIC"
-            nmcli con add \
-                type ethernet \
-                ifname "$IF" \
-                con-name "$CON_NAME" \
-                ipv4.method auto \
-                ipv4.route-metric "$METRIC" \
-                connection.autoconnect yes
-            # 对已获取到 IP 的接口，额外设置静态路由兜底
-            nmcli con modify "$CON_NAME" \
-                +ipv4.routes "0.0.0.0/0 $GW $METRIC" || true
-        fi
+            info "配置 $IF: IP=$IP GW=$GW Table=$T_ID Metric=$METRIC"
+            nmcli con modify "$CON_NAME" ipv4.route-metric $METRIC
 
-        nmcli con up "$CON_NAME" &>/dev/null || true
+            if [ "$NMCLI_SUPPORT_ROUTING_RULES" = true ]; then
+                # 1.18+ 支持 routing-rules
+                nmcli con modify "$CON_NAME" \
+                    ipv4.routing-rules "priority $METRIC from $IP table $T_ID" \
+                    +ipv4.routes "0.0.0.0/0 $GW table=$T_ID metric=$METRIC"
+            else
+                # 旧版本用 dispatcher 脚本持久化
+                add_rt_table $T_ID $IF
+                DISP_DIR="/etc/NetworkManager/dispatcher.d"
+                mkdir -p $DISP_DIR
+                cat <<EOF > $DISP_DIR/99-policy-route-$IF
+#!/bin/bash
+IF=$IF
+IP=$IP
+GW=$GW
+T_ID=$T_ID
+METRIC=$METRIC
+if [ "\$1" = "\$IF" ] && [ "\$2" = "up" ]; then
+    ip rule add from \$IP table \$T_ID priority \$METRIC 2>/dev/null || true
+    ip route add default via \$GW dev \$IF table \$T_ID metric \$METRIC 2>/dev/null || true
+fi
+EOF
+                chmod +x $DISP_DIR/99-policy-route-$IF
+                # 立即生效
+                ip rule add from $IP table $T_ID priority $METRIC 2>/dev/null || true
+                ip route add default via $GW dev $IF table $T_ID metric $METRIC 2>/dev/null || true
+            fi
+            nmcli con up "$CON_NAME"
+        fi
+        T_ID=$((T_ID + 2))
         METRIC=$((METRIC + 100))
     done
-    echo "[OK] NetworkManager 配置已应用"
+    info "完成！查看连接: nmcli con show"
 }
 
-# ──────────────────────────────────────────────
-# 7. 写入配置 — systemd-networkd (.network 文件)
-# ──────────────────────────────────────────────
-write_systemd_networkd() {
-    local ifaces=("$@")
-    local METRIC=100
+# ============================================================
+# 方案三：network-scripts（CentOS 6, 旧版 RHEL）
+# ============================================================
+configure_network_scripts() {
+    SCRIPT_DIR="/etc/sysconfig/network-scripts"
+    info "--- [network-scripts] 步骤 1: 生成网卡配置 ---"
+    for IF in $IFACES; do
+        MAC=$(cat /sys/class/net/$IF/address)
+        cat <<EOF > $SCRIPT_DIR/ifcfg-$IF
+DEVICE=$IF
+HWADDR=$MAC
+BOOTPROTO=dhcp
+ONBOOT=yes
+MTU=1500
+NM_CONTROLLED=no
+EOF
+        info "生成: $SCRIPT_DIR/ifcfg-$IF"
+    done
 
-    echo "[INFO] 使用 systemd-networkd 写入配置"
-    for IF in "${ifaces[@]}"; do
-        local MAC IP GW PREFIX
-        MAC=$(cat "/sys/class/net/$IF/address" 2>/dev/null || echo "")
-        get_ip_gw "$IF"
-        local CONF="/etc/systemd/network/10-${IF}.network"
+    if command -v systemctl &>/dev/null; then
+        systemctl restart network 2>/dev/null || systemctl restart NetworkManager
+    else
+        service network restart
+    fi
 
-        cat > "$CONF" << UNIT
-[Match]
-MACAddress=$MAC
-Name=$IF
+    info "等待 8 秒完成 DHCP 协商..."
+    sleep 8
 
-[Link]
-MTUBytes=1500
+    info "--- [network-scripts] 步骤 2: 配置策略路由 ---"
+    T_ID=100
+    METRIC=100
+    for IF in $IFACES; do
+        IP=$(ip -4 addr show $IF | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        GW=$(ip route show dev $IF | grep default | awk '{print $3}' | head -n 1)
 
-[Network]
-DHCP=ipv4
-
-[DHCP]
-RouteMetric=$METRIC
-UseDNS=yes
-UseNTP=yes
-UNIT
-
-        if [ -n "$IP" ] && [ -n "$GW" ]; then
-            echo "[INFO] $IF  IP=$IP  GW=$GW  metric=$METRIC"
-            # 追加策略路由
-            cat >> "$CONF" << UNIT
-
-[Route]
-Destination=0.0.0.0/0
-Gateway=$GW
-Metric=$METRIC
-UNIT
+        if [ -z "$IP" ] || [ -z "$GW" ]; then
+            warn "$IF 未获取到 IP/GW，跳过"
         else
-            echo "[WARN] $IF 未获取到 IP/GW，仅写 DHCP 配置"
+            info "配置 $IF: IP=$IP GW=$GW Table=$T_ID"
+            add_rt_table $T_ID $IF
+            echo "default via $GW dev $IF table $T_ID metric $METRIC" > $SCRIPT_DIR/route-$IF
+            echo "from $IP table $T_ID priority $METRIC" > $SCRIPT_DIR/rule-$IF
         fi
-
+        T_ID=$((T_ID + 2))
         METRIC=$((METRIC + 100))
     done
 
-    systemctl restart systemd-networkd
-    echo "[OK] systemd-networkd 配置已应用"
+    if command -v systemctl &>/dev/null; then
+        systemctl restart network 2>/dev/null || systemctl restart NetworkManager
+    else
+        service network restart
+    fi
+    info "完成！"
 }
 
-# ──────────────────────────────────────────────
-# 8. 写入配置 — ifupdown (/etc/network/interfaces)
-# ──────────────────────────────────────────────
-write_ifupdown() {
-    local ifaces=("$@")
-    local INT_FILE="/etc/network/interfaces"
+# ============================================================
+# 方案四：ifupdown（Ubuntu 16.04-, Debian）
+# ============================================================
+configure_ifupdown() {
+    CONF_FILE="/etc/network/interfaces"
+    cp $CONF_FILE ${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)
 
-    echo "[INFO] 使用 ifupdown 写入配置: $INT_FILE"
-    # 备份原始文件
-    cp "$INT_FILE" "${INT_FILE}.bak.$(date +%s)" 2>/dev/null || true
-
-    cat > "$INT_FILE" << 'EOF'
-# Generated by getip.sh
-source /etc/network/interfaces.d/*
-
+    info "--- [ifupdown] 步骤 1: 生成临时 DHCP 配置 ---"
+    cat <<EOF > $CONF_FILE
+# 自动生成，原始配置见 .bak 文件
 auto lo
 iface lo inet loopback
 EOF
-
-    local METRIC=100
-    for IF in "${ifaces[@]}"; do
-        local IP GW PREFIX
-        get_ip_gw "$IF"
-
-        cat >> "$INT_FILE" << IFACE
+    for IF in $IFACES; do
+        cat <<EOF >> $CONF_FILE
 
 auto $IF
 iface $IF inet dhcp
+    mtu 1500
+EOF
+    done
+
+    ifdown -a --exclude=lo 2>/dev/null; ifup -a --exclude=lo
+    info "等待 8 秒完成 DHCP 协商..."
+    sleep 8
+
+    info "--- [ifupdown] 步骤 2: 写入策略路由配置 ---"
+    cat <<EOF > $CONF_FILE
+# 自动生成（含策略路由），原始配置见 .bak 文件
+auto lo
+iface lo inet loopback
+EOF
+    T_ID=100
+    METRIC=100
+    for IF in $IFACES; do
+        IP=$(ip -4 addr show $IF | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        GW=$(ip route show dev $IF | grep default | awk '{print $3}' | head -n 1)
+
+        if [ -z "$IP" ] || [ -z "$GW" ]; then
+            warn "$IF 未获取到 IP/GW，写入基础 DHCP"
+            cat <<EOF >> $CONF_FILE
+
+auto $IF
+iface $IF inet dhcp
+    mtu 1500
+EOF
+        else
+            info "配置 $IF: IP=$IP GW=$GW Table=$T_ID Metric=$METRIC"
+            add_rt_table $T_ID $IF
+            cat <<EOF >> $CONF_FILE
+
+auto $IF
+iface $IF inet dhcp
+    mtu 1500
     metric $METRIC
-IFACE
-
-        if [ -n "$IP" ] && [ -n "$GW" ]; then
-            echo "[INFO] $IF  IP=$IP  GW=$GW  metric=$METRIC"
-            cat >> "$INT_FILE" << IFACE
-    post-up ip route add default via $GW dev $IF metric $METRIC || true
-IFACE
-        else
-            echo "[WARN] $IF 未获取到 IP/GW，仅写 DHCP"
+    post-up ip rule add from $IP table $T_ID priority $METRIC || true
+    post-up ip route add default via $GW dev $IF table $T_ID metric $METRIC || true
+    pre-down ip rule del from $IP table $T_ID priority $METRIC || true
+    pre-down ip route del default via $GW dev $IF table $T_ID || true
+EOF
         fi
-
+        T_ID=$((T_ID + 2))
         METRIC=$((METRIC + 100))
     done
 
-    # 重启网络服务（兼容 sysvinit 和 systemd）
-    if command -v systemctl &>/dev/null; then
-        systemctl restart networking 2>/dev/null || ifdown -a --ignore-errors && ifup -a || true
-    else
-        /etc/init.d/networking restart || true
-    fi
-    echo "[OK] ifupdown 配置已应用"
+    ifdown -a --exclude=lo 2>/dev/null; ifup -a --exclude=lo
+    info "完成！查看配置: cat $CONF_FILE"
 }
 
-# ──────────────────────────────────────────────
-# 9. 兜底: 仅用 ip 命令临时配置（不写持久化）
-# ──────────────────────────────────────────────
-write_iproute2_only() {
-    local ifaces=("$@")
-    echo "[WARN] 未识别持久化网络栈，仅通过 ip 命令临时配置（重启后失效）"
-    local METRIC=100
-    for IF in "${ifaces[@]}"; do
-        local IP GW PREFIX
-        get_ip_gw "$IF"
-        if [ -n "$IP" ] && [ -n "$GW" ]; then
-            echo "[INFO] $IF  IP=$IP  GW=$GW  metric=$METRIC"
-            ip route replace default via "$GW" dev "$IF" metric "$METRIC" 2>/dev/null || true
-        fi
-        METRIC=$((METRIC + 100))
-    done
-    echo "[OK] 临时路由已设置"
-}
-
-# ──────────────────────────────────────────────
+# ============================================================
 # 主流程
-# ──────────────────────────────────────────────
-main() {
-    cat << 'BANNER'
-╔══════════════════════════════════════════════════════════════════════════╗
-║              getip.sh — 全平台多网卡 IP 自动配置脚本                   ║
-║                                                                          ║
-║  支持的系统与版本 (按网络栈分组):                                        ║
-║                                                                          ║
-║  [netplan]         Ubuntu 17.10/18.04/20.04/22.04/24.04                 ║
-║                    Ubuntu Server 18.04/20.04/22.04/24.04                ║
-║                    Debian 12 (若已启用 netplan)                         ║
-║                                                                          ║
-║  [NetworkManager]  CentOS 7/8/8-Stream/9-Stream                         ║
-║                    RHEL 7/8/9                                            ║
-║                    Rocky Linux 8/9  |  AlmaLinux 8/9                    ║
-║                    Fedora 36~41+    |  openSUSE Leap 15.x / Tumbleweed  ║
-║                    SLES 15+                                              ║
-║                                                                          ║
-║  [systemd-networkd] Debian 10/11/12 (最小化安装)                        ║
-║                     Ubuntu 16.04/18.04 (无 netplan 环境)                ║
-║                     Arch Linux / Manjaro (rolling)                      ║
-║                                                                          ║
-║  [ifupdown]        Debian 9/10/11/12 (传统安装)                         ║
-║                     Ubuntu 14.04/16.04                                  ║
-║                     Raspbian / RPiOS (所有版本)                         ║
-║                     Linux Mint 19/20/21  |  Kali Linux (rolling)        ║
-║                                                                          ║
-║  [iproute2-only]   任意 Linux 发行版 (兜底，临时生效，不持久化)         ║
-║                                                                          ║
-║  注意: 需要 bash 4.0+, root 权限, iproute2 工具集                       ║
-╚══════════════════════════════════════════════════════════════════════════╝
-BANNER
-    echo ""
+# ============================================================
+echo "================================================"
+echo "  多发行版网络配置脚本"
+echo "================================================"
 
-    detect_distro
-    detect_network_stack
+detect_os
+detect_network_manager
+get_interfaces
 
-    echo "[INFO] 发行版:  ${DISTRO_ID} ${DISTRO_VER} (like: ${DISTRO_LIKE:-none})"
-    echo "[INFO] 网络栈:  ${NETWORK_STACK}"
+[ -z "$IFACES" ] && error "未检测到任何物理网卡，退出"
 
-    # 收集物理网卡列表
-    mapfile -t IFACES < <(get_physical_ifaces)
-    if [ ${#IFACES[@]} -eq 0 ]; then
-        echo "[ERROR] 未发现任何物理网卡，退出" >&2
-        exit 1
-    fi
-    echo "[INFO] 发现网卡: ${IFACES[*]}"
+case $NET_MANAGER in
+    netplan)         configure_netplan ;;
+    nmcli)           configure_nmcli ;;
+    network-scripts) configure_network_scripts ;;
+    ifupdown)        configure_ifupdown ;;
+    *)               error "未知网络管理方式: $NET_MANAGER" ;;
+esac
 
-    # 第一阶段：激活 DHCP 获取 IP
-    echo ""
-    echo "--- 阶段 1: DHCP 激活 ---"
-    activate_dhcp_all "${IFACES[@]}"
-
-    # 第二阶段：写入持久化配置
-    echo ""
-    echo "--- 阶段 2: 写入持久化配置 ---"
-    case "$NETWORK_STACK" in
-        netplan)            write_netplan           "${IFACES[@]}" ;;
-        networkmanager)     write_networkmanager    "${IFACES[@]}" ;;
-        systemd-networkd)   write_systemd_networkd  "${IFACES[@]}" ;;
-        ifupdown)           write_ifupdown          "${IFACES[@]}" ;;
-        *)                  write_iproute2_only     "${IFACES[@]}" ;;
-    esac
-
-    # 第三阶段：汇总结果
-    echo ""
-    echo "--- 阶段 3: 当前网卡状态汇总 ---"
-    for IF in "${IFACES[@]}"; do
-        local IP GW PREFIX
-        get_ip_gw "$IF"
-        if [ -n "$IP" ]; then
-            printf "  %-12s  IP=%-18s GW=%s\n" "$IF" "${IP}/${PREFIX}" "${GW:-N/A}"
-        else
-            printf "  %-12s  [未获取到 IP]\n" "$IF"
-        fi
-    done
-
-    echo ""
-    echo "[DONE] 配置完成。"
-}
-
-main "$@"
+echo "================================================"
+info "全部完成！当前网络状态："
+ip -4 addr show | grep -E 'inet |^[0-9]'
+echo "================================================"
